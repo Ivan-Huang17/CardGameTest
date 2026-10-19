@@ -3,12 +3,15 @@ import org.gradle.internal.os.OperatingSystem
 apply plugin: 'com.android.application'
 
 android {
-    compileSdkVersion PROP_COMPILE_SDK_VERSION.toInteger()
+    namespace "org.cocos2dx.PokerGame"
+    compileSdk PROP_COMPILE_SDK_VERSION.toInteger()
+    // 显式声明本机已安装的 NDK 版本，覆盖 AGP 8.x 的内置默认值（25.1.8937393）
+    ndkVersion "27.2.12479018"
 
     defaultConfig {
         applicationId "org.cocos2dx.PokerGame"
-        minSdkVersion PROP_MIN_SDK_VERSION
-        targetSdkVersion PROP_TARGET_SDK_VERSION
+        minSdk PROP_MIN_SDK_VERSION.toInteger()
+        targetSdk PROP_TARGET_SDK_VERSION.toInteger()
         versionCode 1
         versionName "1.0"
 
@@ -34,8 +37,11 @@ android {
             else if (PROP_BUILD_TYPE == 'cmake') {
                 cmake {
                     targets 'MyGame'
-                    arguments "-DCMAKE_FIND_ROOT_PATH=", "-DANDROID_STL=c++_static", "-DANDROID_TOOLCHAIN=clang", "-DANDROID_ARM_NEON=TRUE"
-                    cppFlags "-frtti -fexceptions -fsigned-char"
+                    arguments "-DANDROID_STL=c++_static",
+                              "-DANDROID_TOOLCHAIN=clang",
+                              "-DANDROID_ARM_NEON=TRUE",
+                              "-DANDROID_PLATFORM=android-21"
+                    cppFlags "-frtti -fexceptions -fsigned-char -std=c++17"
                 }
             }
         }
@@ -62,13 +68,13 @@ android {
         else if (PROP_BUILD_TYPE == 'cmake') {
             cmake {
                 path "../../CMakeLists.txt"
+                version "3.22.1"
             }
         }
     }
 
     signingConfigs {
-
-       release {
+        release {
             if (project.hasProperty("RELEASE_STORE_FILE")) {
                 storeFile file(RELEASE_STORE_FILE)
                 storePassword RELEASE_STORE_PASSWORD
@@ -82,43 +88,36 @@ android {
         release {
             debuggable false
             jniDebuggable false
-            renderscriptDebuggable false
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
             if (project.hasProperty("RELEASE_STORE_FILE")) {
                 signingConfig signingConfigs.release
             }
-
-            externalNativeBuild {
-                ndkBuild {
-                    arguments 'NDK_DEBUG=0'
-                }
-            }
         }
 
         debug {
             debuggable true
             jniDebuggable true
-            renderscriptDebuggable true
-            externalNativeBuild {
-                ndkBuild {
-                    arguments 'NDK_DEBUG=1'
-                }
-            }
         }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
     }
 }
 
 android.applicationVariants.all { variant ->
-    // delete previous files first
     delete "${buildDir}/intermediates/assets/${variant.dirName}"
 
-    variant.mergeAssets.doLast {
-        copy {
-            from "${buildDir}/../../../Resources"
-            into "${buildDir}/intermediates/assets/${variant.dirName}"
-            exclude "**/*.gz"
+    variant.mergeAssetsProvider.configure {
+        doLast {
+            copy {
+                from "${buildDir}/../../../Resources"
+                into "${buildDir}/intermediates/assets/${variant.dirName}"
+                exclude "**/*.gz"
+            }
         }
     }
 }

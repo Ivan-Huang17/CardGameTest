@@ -6,7 +6,7 @@
 //
 
 #include "GameController.hpp"
-#include "LevelConfigLoader.hpp"
+#include "LevelConfig.hpp"
 USING_NS_CC;
 //游戏入口
 void GameController::startGame(){

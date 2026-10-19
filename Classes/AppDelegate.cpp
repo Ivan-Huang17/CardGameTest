@@ -84,7 +84,6 @@ bool AppDelegate::applicationDidFinishLaunching() {
     auto glview = director->getOpenGLView();
     if(!glview) {
 #if ( CC_TARGET_PLATFORM == CC_PLATFORM_WIN32) || (CC_TARGET_PLATFORM == CC_PLATFORM_MAC) || (CC_TARGET_PLATFORM == CC_PLATFORM_LINUX||CC_TARGET_PLATFORM==CC_PLATFORM_IOS)
-        //glview = GLViewImpl::createWithRect("PokerGame", cocos2d::Rect(0, 0, designResolutionSize.width, designResolutionSize.height));
         glview = GLViewImpl::createWithRect("Test", cocos2d::Rect(0, 0, 1080, 2080), 0.5);
 #else
         glview = GLViewImpl::create("PokerGame");
@@ -120,6 +119,13 @@ bool AppDelegate::applicationDidFinishLaunching() {
     }
 
     register_all_packages();
+
+    // 添加资源搜索路径，让 Sprite::create("xxx.png") 能找到子目录中的资源
+    auto fileUtils = cocos2d::FileUtils::getInstance();
+    fileUtils->addSearchPath("card/");
+    fileUtils->addSearchPath("card/number/");
+    fileUtils->addSearchPath("card/suits/");
+    fileUtils->addSearchPath("configs/");
 
     auto gameController=GameController::create();
     gameController->retain();

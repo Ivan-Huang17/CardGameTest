@@ -49,11 +49,29 @@ endif()
 # add cross-platforms source files and header files 
 list(APPEND GAME_SOURCE
      Classes/AppDelegate.cpp
-     Classes/HelloWorldScene.cpp
+     Classes/configs/LevelConfig.cpp
+     Classes/controllers/GameController.cpp
+     Classes/controllers/PlayFiledController.cpp
+     Classes/controllers/StackController.cpp
+     Classes/models/CardModel.cpp
+     Classes/models/GameModel.cpp
+     Classes/views/CardView.cpp
+     Classes/views/GameView.cpp
+     Classes/views/PlayFieldView.cpp
+     Classes/views/StackView.cpp
      )
 list(APPEND GAME_HEADER
      Classes/AppDelegate.h
-     Classes/HelloWorldScene.h
+     Classes/configs/LevelConfig.hpp
+     Classes/controllers/GameController.hpp
+     Classes/controllers/PlayFiledController.hpp
+     Classes/controllers/StackController.hpp
+     Classes/models/CardModel.hpp
+     Classes/models/GameModel.hpp
+     Classes/views/CardView.hpp
+     Classes/views/GameView.hpp
+     Classes/views/PlayFieldView.hpp
+     Classes/views/StackView.hpp
      )
 
 if(ANDROID)
@@ -124,7 +142,12 @@ endif()
 target_link_libraries(${APP_NAME} cocos2d)
 target_include_directories(${APP_NAME}
         PRIVATE Classes
+        PRIVATE Classes/configs
+        PRIVATE Classes/controllers
+        PRIVATE Classes/models
+        PRIVATE Classes/views
         PRIVATE ${COCOS2DX_ROOT_PATH}/cocos/audio/include/
+        PRIVATE ${COCOS2DX_ROOT_PATH}/external
 )
 
 # mark app resources

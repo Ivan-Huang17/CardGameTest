@@ -42,3 +42,12 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+
+# Java / Android 编译产物
+*.class
+*.jar
+*.apk
+*.aab
+*.bin
+*.txt
+*.dex

@@ -3,21 +3,32 @@
 buildscript {
     repositories {
         google()
-        jcenter()
+        mavenCentral()
     }
 
     dependencies {
-        classpath 'com.android.tools.build:gradle:3.1.0'
-
-        // NOTE: Do not place your application dependencies here; they belong
-        // in the individual module build.gradle files
+        classpath 'com.android.tools.build:gradle:8.3.2'
     }
 }
 
 allprojects {
     repositories {
         google()
-        jcenter()
+        mavenCentral()
+    }
+}
+
+// AGP 8.x 要求每个 library 模块必须有 namespace。
+// libcocos2dx 是引擎内部模块，不改它的源文件，在这里注入。
+subprojects {
+    plugins.withId('com.android.library') {
+        android {
+            namespace "org.cocos2dx.lib"
+            compileOptions {
+                sourceCompatibility JavaVersion.VERSION_11
+                targetCompatibility JavaVersion.VERSION_11
+            }
+        }
     }
 }
 
