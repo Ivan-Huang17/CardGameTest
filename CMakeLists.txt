@@ -59,6 +59,9 @@ list(APPEND GAME_SOURCE
      Classes/views/GameView.cpp
      Classes/views/PlayFieldView.cpp
      Classes/views/StackView.cpp
+     Classes/Highlight/Phase2Verifier.cpp
+     Classes/Highlight/GameFrameCapture.cpp
+     Classes/Highlight/HighlightService.cpp
      )
 list(APPEND GAME_HEADER
      Classes/AppDelegate.h
@@ -72,6 +75,9 @@ list(APPEND GAME_HEADER
      Classes/views/GameView.hpp
      Classes/views/PlayFieldView.hpp
      Classes/views/StackView.hpp
+     Classes/Highlight/Phase2Verifier.hpp
+     Classes/Highlight/GameFrameCapture.hpp
+     Classes/Highlight/HighlightService.hpp
      )
 
 if(ANDROID)
@@ -140,12 +146,19 @@ else()
 endif()
 
 target_link_libraries(${APP_NAME} cocos2d)
+
+# Android 下链接 EGL（Phase2Verifier 需要查询 EGLConfig）
+if(ANDROID)
+    target_link_libraries(${APP_NAME} EGL GLESv3 android)
+endif()
+
 target_include_directories(${APP_NAME}
         PRIVATE Classes
         PRIVATE Classes/configs
         PRIVATE Classes/controllers
         PRIVATE Classes/models
         PRIVATE Classes/views
+        PRIVATE Classes/Highlight
         PRIVATE ${COCOS2DX_ROOT_PATH}/cocos/audio/include/
         PRIVATE ${COCOS2DX_ROOT_PATH}/external
 )

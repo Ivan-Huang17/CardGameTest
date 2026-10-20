@@ -6,8 +6,9 @@
 //
 
 #include "GameView.hpp"
-#include"CardView.hpp"
-#include"CardModel.hpp"
+#include "CardView.hpp"
+#include "CardModel.hpp"
+#include "Phase2Verifier.hpp"
 USING_NS_CC;
 Scene* GameView::createScene(){
     return GameView::create();

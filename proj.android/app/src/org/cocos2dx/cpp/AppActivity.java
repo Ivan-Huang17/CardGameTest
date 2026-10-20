@@ -1,7 +1,7 @@
 /****************************************************************************
 Copyright (c) 2015-2016 Chukong Technologies Inc.
 Copyright (c) 2017-2018 Xiamen Yaji Software Co., Ltd.
- 
+
 http://www.cocos2d-x.org
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -24,35 +24,131 @@ THE SOFTWARE.
 ****************************************************************************/
 package org.cocos2dx.cpp;
 
-import android.os.Bundle;
-import org.cocos2dx.lib.Cocos2dxActivity;
+import android.Manifest;
+import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
+import android.view.Surface;
 import android.view.WindowManager;
-import android.view.WindowManager.LayoutParams;
+
+import org.cocos2dx.cpp.highlight.HighlightRecorder;
+import org.cocos2dx.lib.Cocos2dxActivity;
+
+import java.util.ArrayList;
+import java.util.List;
 
 public class AppActivity extends Cocos2dxActivity {
+
+    private static final String TAG = "AppActivity";
+    private static final int REQ_PERMISSIONS = 100;
+
+    private HighlightRecorder highlightRecorder;
+
+    // JNI 方法声明：C++ HighlightService 实现这些
+    private native void nativeOnSurfaceReady(Surface surface, int encW, int encH);
+    private native void nativeStart();
+    private native void nativeStop();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.setEnableVirtualButton(false);
         super.onCreate(savedInstanceState);
-        // Workaround in https://stackoverflow.com/questions/16283079/re-launch-of-activity-on-home-button-but-only-the-first-time/16447508
+
         if (!isTaskRoot()) {
-            // Android launched another instance of the root activity into an existing task
-            //  so just quietly finish and go away, dropping the user back into the activity
-            //  at the top of the stack (ie: the last state of this task)
-            // Don't need to finish it again since it's finished in super.onCreate .
             return;
         }
-        // Make sure we're running on Pie or higher to change cutout mode
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            // Enable rendering into the cutout area
             WindowManager.LayoutParams lp = getWindow().getAttributes();
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
             getWindow().setAttributes(lp);
         }
-        // DO OTHER INITIALIZATION BELOW
-        
+
+        requestRecordPermissions();
     }
 
+    // ------------------------------------------------------------------
+    // 录制启动流程
+    // 权限就绪 → prepare（Java，返回 Surface）→ nativeOnSurfaceReady（C++ EGL初始化）
+    // → nativeStart（C++ 挂钩子）→ Java start（编码器开始接收帧）
+    // ------------------------------------------------------------------
+
+    private void startHighlightRecording() {
+        highlightRecorder = HighlightRecorder.getInstance(this);
+
+        // 1. Java 侧准备编码器，拿到 InputSurface
+        Surface inputSurface = highlightRecorder.prepare();
+        if (inputSurface == null) {
+            Log.e(TAG, "HighlightRecorder.prepare() 失败");
+            return;
+        }
+
+        int encW = highlightRecorder.getEncoderWidth();
+        int encH = highlightRecorder.getEncoderHeight();
+
+        // 2. 把 Surface 传给 C++，C++ 在 GL 线程初始化 EGLSurface
+        nativeOnSurfaceReady(inputSurface, encW, encH);
+
+        // 3. 等 GL 线程完成 EGL 初始化（异步投递，留一帧时间）
+        //    再启动编码器开始接收帧
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+        // 顺序很重要：
+        // 1. 先 start Java 编码器，激活 InputSurface 的 BufferQueue
+        // 2. 再挂 C++ 钩子，确保第一帧送到时编码器已经 ready
+        highlightRecorder.start();   // Java：codec.start()，激活 Surface
+        nativeStart();               // C++：挂 EVENT_AFTER_DRAW 钩子，开始送帧
+        Log.i(TAG, "高光录制已启动");
+
+            // 阶段二验证：录 10 秒后自动停止，检查相册里的视频
+            new Handler(Looper.getMainLooper()).postDelayed(
+                    this::stopHighlightRecording, 10_000);
+        }, 500);
+    }
+
+    private void stopHighlightRecording() {
+        Log.i(TAG, "停止录制...");
+        nativeStop();                    // C++：先移除钩子，停止送帧
+        if (highlightRecorder != null) {
+            highlightRecorder.stop();    // Java：EOS → 封装 → 落盘
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 权限申请
+    // ------------------------------------------------------------------
+
+    private void requestRecordPermissions() {
+        List<String> needed = new ArrayList<>();
+
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.RECORD_AUDIO);
+        }
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P
+                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+        }
+
+        if (needed.isEmpty()) {
+            new Handler(Looper.getMainLooper()).postDelayed(
+                    this::startHighlightRecording, 2000);
+        } else {
+            requestPermissions(needed.toArray(new String[0]), REQ_PERMISSIONS);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode,
+                                           String[] permissions,
+                                           int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQ_PERMISSIONS) return;
+
+        new Handler(Looper.getMainLooper()).postDelayed(
+                this::startHighlightRecording, 2000);
+    }
 }
