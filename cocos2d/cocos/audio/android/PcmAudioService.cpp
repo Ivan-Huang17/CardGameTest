@@ -32,6 +32,13 @@ namespace cocos2d { namespace experimental {
 
 static std::vector<char> __silenceData;
 
+// [高光录制补丁] 全局音频分流回调
+static AudioCaptureCallback gAudioCaptureCallback = nullptr;
+
+void PcmAudioService::setAudioCaptureCallback(AudioCaptureCallback cb) {
+    gAudioCaptureCallback = std::move(cb);
+}
+
 #define AUDIO_PLAYER_BUFFER_COUNT (2)
 
 class SLPcmAudioPlayerCallbackProxy
@@ -60,7 +67,8 @@ PcmAudioService::~PcmAudioService()
 
 bool PcmAudioService::enqueue()
 {
-    if (_controller->hasPlayingTacks())
+    bool hasPlayingTracks = _controller->hasPlayingTacks();
+    if (hasPlayingTracks)
     {
         if (_controller->isPaused())
         {
@@ -73,6 +81,13 @@ bool PcmAudioService::enqueue()
 
             auto current = _controller->current();
             ALOG_ASSERT(current != nullptr, "current buffer is nullptr ...");
+
+            // [高光录制补丁] 混音后、送播放器之前分流一份给录制模块
+            if (gAudioCaptureCallback) {
+                gAudioCaptureCallback(current->buf, current->size,
+                                      _sampleRate, _numChannels);
+            }
+
             SLresult r = (*_bufferQueueItf)->Enqueue(_bufferQueueItf, current->buf, current->size);
             SL_RETURN_VAL_IF_FAILED(r, false, "enqueue failed!");
         }

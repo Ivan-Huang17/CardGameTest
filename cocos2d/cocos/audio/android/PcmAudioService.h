@@ -31,10 +31,20 @@ THE SOFTWARE.
 
 #include <mutex>
 #include <condition_variable>
+#include <functional>
+#include <stddef.h>
 
 namespace cocos2d { namespace experimental {
 
 class AudioMixerController;
+
+/**
+ * [高光录制补丁] 音频 PCM 分流回调类型。
+ * 引擎侧只持有函数指针，不依赖游戏层头文件，避免循环依赖。
+ * 游戏层通过 PcmAudioService::setAudioCaptureCallback 注入。
+ */
+using AudioCaptureCallback =
+    std::function<void(const void* buf, size_t size, int sampleRate, int channels)>;
 
 class PcmAudioService
 {
@@ -44,6 +54,13 @@ public:
 
     inline int getSampleRate() const
     { return _sampleRate; };
+
+    /**
+     * [高光录制补丁] 注册 PCM 分流回调。
+     * 由 HighlightService::start() 在录制开始时调用，传入 HighlightService::onAudioFrame。
+     * 传 nullptr 可清除回调（停止分流）。
+     */
+    static void setAudioCaptureCallback(AudioCaptureCallback cb);
 
 private:
     PcmAudioService(SLEngineItf engineItf, SLObjectItf outputMixObject);

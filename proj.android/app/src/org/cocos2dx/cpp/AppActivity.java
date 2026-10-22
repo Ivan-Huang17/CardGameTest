@@ -46,6 +46,8 @@ public class AppActivity extends Cocos2dxActivity {
     private static final int REQ_PERMISSIONS = 100;
 
     private HighlightRecorder highlightRecorder;
+    private Handler statsHandler;
+    private Runnable statsRunnable;
 
     // JNI 方法声明：C++ HighlightService 实现这些
     private native void nativeOnSurfaceReady(Surface surface, int encW, int encH);
@@ -102,17 +104,41 @@ public class AppActivity extends Cocos2dxActivity {
         nativeStart();               // C++：挂 EVENT_AFTER_DRAW 钩子，开始送帧
         Log.i(TAG, "高光录制已启动");
 
-            // 阶段二验证：录 10 秒后自动停止，检查相册里的视频
+            startBufferStatsLogging();
+
+            // 阶段三验证：录 30 秒后自动停止（超过 maxGopCount=20s，观察淘汰是否生效）
             new Handler(Looper.getMainLooper()).postDelayed(
-                    this::stopHighlightRecording, 10_000);
+                    this::stopHighlightRecording, 30_000);
         }, 500);
+    }
+
+    /** 每秒打印一次环形缓冲区状态，用于阶段三验证 GOP 淘汰和内存占用。 */
+    private void startBufferStatsLogging() {
+        statsHandler = new Handler(Looper.getMainLooper());
+        statsRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (highlightRecorder != null) {
+                    highlightRecorder.logBufferStats();
+                }
+                statsHandler.postDelayed(this, 1000);
+            }
+        };
+        statsHandler.post(statsRunnable);
+    }
+
+    private void stopBufferStatsLogging() {
+        if (statsHandler != null && statsRunnable != null) {
+            statsHandler.removeCallbacks(statsRunnable);
+        }
     }
 
     private void stopHighlightRecording() {
         Log.i(TAG, "停止录制...");
+        stopBufferStatsLogging();
         nativeStop();                    // C++：先移除钩子，停止送帧
         if (highlightRecorder != null) {
-            highlightRecorder.stop();    // Java：EOS → 封装 → 落盘
+            highlightRecorder.stop();    // Java：停止编码，并把环形缓冲内容封装落盘到相册
         }
     }
 

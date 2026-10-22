@@ -26,7 +26,7 @@
 //#include "HelloWorldScene.h"
 #include"GameController.hpp"
 
-// #define USE_AUDIO_ENGINE 1
+#define USE_AUDIO_ENGINE 1
 // #define USE_SIMPLE_AUDIO_ENGINE 1
 
 #if USE_AUDIO_ENGINE && USE_SIMPLE_AUDIO_ENGINE
@@ -126,6 +126,12 @@ bool AppDelegate::applicationDidFinishLaunching() {
     fileUtils->addSearchPath("card/number/");
     fileUtils->addSearchPath("card/suits/");
     fileUtils->addSearchPath("configs/");
+    fileUtils->addSearchPath("audio/");
+
+#if USE_AUDIO_ENGINE
+    // 循环播放背景音乐，loop=true
+    AudioEngine::play2d("bgm.mp3", true);
+#endif
 
     auto gameController=GameController::create();
     gameController->retain();

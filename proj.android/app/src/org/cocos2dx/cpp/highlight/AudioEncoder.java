@@ -13,22 +13,19 @@ import android.util.Log;
 
 import java.nio.ByteBuffer;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 音频编码器：麦克风 PCM → AAC-LC → {@link SampleSink}。
+ * 音频编码器：PCM → AAC-LC → {@link SampleSink}。
  *
- * <p>阶段一简化版：只支持麦克风音源，去掉回采、救援、RecordingConfig 等依赖。
- * 后续阶段再按需扩展音源。
- *
- * <h3>关键：-2 与 -1 不是一回事</h3>
- * {@code dequeueOutputBuffer} 的 {@code INFO_OUTPUT_FORMAT_CHANGED(-2)} 必须单独处理，
- * 它携带 AAC 的 AudioSpecificConfig(csd-0)，封装器只有拿到它才能 addTrack(AUDIO)。
- * 如果像 {@code if (index < 0) break} 那样统一忽略，音轨就永远建立不起来。
- *
- * <h3>音画同步</h3>
- * 用 {@code AudioRecord.getTimestamp} 反推第 0 个采样帧对应的系统单调时间，
- * 使音频 PTS 与视频 PTS（来自 eglPresentationTimeANDROID）落在同一时基上。
+ * <p>支持两种音频来源：
+ * <ul>
+ *   <li><b>引擎分流模式</b>（本项目使用）：外部调用 {@link #feedPcm} 喂 PCM，
+ *       数据来自 PcmAudioService 的混音输出（通过 C++ 攒批 + JNI 传入）；
+ *       此模式下 {@code AudioRecord} 不启动，不需要 RECORD_AUDIO 权限。</li>
+ *   <li><b>麦克风模式</b>：内部 {@code AudioRecord} 循环读取（原始逻辑保留）。</li>
+ * </ul>
  */
 public final class AudioEncoder {
 
@@ -41,11 +38,21 @@ public final class AudioEncoder {
     private final SampleSink sink;
 
     private MediaCodec codec;
-    private AudioRecord record;
+    private AudioRecord record;   // 麦克风模式时使用，引擎分流模式为 null
     private Thread thread;
     private final CountDownLatch eosLatch = new CountDownLatch(1);
     private volatile boolean running;
     private volatile boolean prepared;
+
+    // 引擎分流模式：外部喂入的 PCM 批次队列
+    // 每个元素是 { pcmData, ptsNs }
+    private static final class PcmBatch {
+        final byte[] data;
+        final long ptsNs;
+        PcmBatch(byte[] data, long ptsNs) { this.data = data; this.ptsNs = ptsNs; }
+    }
+    private final LinkedBlockingQueue<PcmBatch> pcmQueue = new LinkedBlockingQueue<>(64);
+    private boolean engineMode = false;  // true = 引擎分流模式
 
     // 每次 read 的 PCM 缓冲：16bit 立体声，约 4096 样本帧
     private static final int PCM_BUFFER_SAMPLES = 4096;
@@ -66,15 +73,16 @@ public final class AudioEncoder {
     // ------------------------------------------------------------------
 
     /**
-     * 准备编码器与麦克风采集器。
-     *
-     * @throws IllegalStateException 设备不支持 AAC 编码或麦克风不可用
+     * 准备编码器。
+     * 引擎分流模式下不启动 AudioRecord，prepare 成功后等待 {@link #feedPcm} 喂数据。
      */
     public void prepare() {
         prepareEncoder();
-        prepareAudioRecord();
-        pcmBuffer = new byte[PCM_BUFFER_SAMPLES * channels * 2]; // 16bit = 2字节/样本
+        // 不创建 AudioRecord，改用引擎分流模式
+        engineMode = true;
+        pcmBuffer = new byte[PCM_BUFFER_SAMPLES * channels * 2];
         prepared = true;
+        Log.i(TAG, "AudioEncoder 准备完成（引擎分流模式）");
     }
 
     private void prepareEncoder() {
@@ -107,7 +115,6 @@ public final class AudioEncoder {
                 : AudioFormat.CHANNEL_IN_MONO;
         int minBuffer = AudioRecord.getMinBufferSize(
                 sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT);
-        // 取两倍最小缓冲与 200ms 帧量的较大值，避免高采样率下频繁短读
         int bufferBytes = Math.max(minBuffer * 2, sampleRate * channels * 2 / 5);
 
         this.record = new AudioRecord(
@@ -128,21 +135,32 @@ public final class AudioEncoder {
     public void start() {
         if (!prepared) throw new IllegalStateException("prepare() 尚未调用");
         codec.start();
-        record.startRecording();
-        if (record.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
-            Log.w(TAG, "AudioRecord 未进入录音态: " + record.getRecordingState());
+        if (record != null) {
+            record.startRecording();
         }
         running = true;
-        thread = new Thread(this::loop, "hl-audio-encode");
+        thread = new Thread(engineMode ? this::loopEngineMode : this::loop,
+                "hl-audio-encode");
         thread.start();
     }
 
     /**
-     * 停止采集与编码。
-     * 顺序：停采集 → 排空编码器尾部 → stop/release 编码器。
+     * 外部喂入一批 PCM 数据（引擎分流模式专用）。
+     * 由 {@link HighlightRecorder#onAudioBatch} 在 JNI 调用时触发。
+     *
+     * @param pcm   PCM 字节数组（S16 interleaved，深拷贝后的数据）
+     * @param ptsNs 本批第一个采样点的 CLOCK_MONOTONIC 时间戳（纳秒），来自 C++ 侧
      */
+    public void feedPcm(byte[] pcm, long ptsNs) {
+        if (!running || pcm == null || pcm.length == 0) return;
+        // 队列满时丢弃本批（录制优先级低于游戏流畅）
+        pcmQueue.offer(new PcmBatch(pcm, ptsNs));
+    }
+
     public void stop() {
         running = false;
+        // 唤醒可能阻塞在 queue.poll 的编码线程
+        pcmQueue.offer(new PcmBatch(new byte[0], -1));
         if (thread != null) {
             try { thread.join(1_500); } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -173,7 +191,60 @@ public final class AudioEncoder {
     }
 
     // ------------------------------------------------------------------
-    // 采集 + 编码循环
+    // 引擎分流模式编码循环
+    // ------------------------------------------------------------------
+
+    /**
+     * 引擎分流模式：从 {@link #pcmQueue} 取批次数据喂给 MediaCodec。
+     * PTS 直接用 C++ 传来的时间戳（CLOCK_MONOTONIC 纳秒转微秒），与视频帧同源。
+     */
+    private void loopEngineMode() {
+        MediaCodec.BufferInfo outInfo = new MediaCodec.BufferInfo();
+        try {
+            while (running) {
+                // 从队列取一批数据，最多等 100ms
+                PcmBatch batch = pcmQueue.poll(2000, TimeUnit.MILLISECONDS);
+                if (batch == null) continue;
+                if (batch.data.length == 0) break; // stop() 发来的退出信号
+
+                // 计算这批数据的 PTS（微秒），以 C++ 时间戳为基准
+                long batchPtsUs = batch.ptsNs / 1000;
+                int offset = 0;
+
+                // 把这批 PCM 按编码器帧大小逐块送入
+                while (offset < batch.data.length) {
+                    int inIndex = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US);
+                    if (inIndex < 0) break;
+
+                    ByteBuffer inBuf = codec.getInputBuffer(inIndex);
+                    if (inBuf == null) {
+                        codec.queueInputBuffer(inIndex, 0, 0, 0, 0);
+                        break;
+                    }
+                    inBuf.clear();
+                    int room = Math.min(inBuf.remaining(), batch.data.length - offset);
+                    inBuf.put(batch.data, offset, room);
+
+                    // 逐帧推算 PTS：基于采样数偏移，精确到采样级别
+                    int samplesOffset = offset / (channels * 2);
+                    long framePtsUs = batchPtsUs + samplesOffset * 1_000_000L / sampleRate;
+
+                    codec.queueInputBuffer(inIndex, 0, room, framePtsUs, 0);
+                    offset += room;
+                }
+
+                drainOnce(outInfo);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "音频编码线程（引擎分流模式）异常", t);
+            sink.onEncoderError(Track.AUDIO, t);
+        } finally {
+            eosLatch.countDown();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 麦克风模式编码循环（原始逻辑保留）
     // ------------------------------------------------------------------
 
     private void loop() {
@@ -183,7 +254,6 @@ public final class AudioEncoder {
 
         try {
             while (running) {
-                // ── 1) PCM → 编码器输入 ──────────────────────────────────
                 int inIndex = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US);
                 if (inIndex >= 0) {
                     ByteBuffer inBuf = codec.getInputBuffer(inIndex);
@@ -208,8 +278,6 @@ public final class AudioEncoder {
                         }
                     }
                 }
-
-                // ── 2) 编码器输出 → Sink ─────────────────────────────────
                 drainOnce(outInfo);
             }
         } catch (Throwable t) {
@@ -220,57 +288,45 @@ public final class AudioEncoder {
         }
     }
 
-    /** 把编码器当前所有可取的输出包排空一次。 */
     private void drainOnce(MediaCodec.BufferInfo info) {
         while (true) {
             int index = codec.dequeueOutputBuffer(info, 0);
-            // ★ -2 与 -1 必须分开处理，见类注释
             if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 sink.onTrackFormat(Track.AUDIO, codec.getOutputFormat());
                 continue;
             }
-            if (index < 0) break; // INFO_TRY_AGAIN_LATER(-1) 或 INFO_OUTPUT_BUFFERS_CHANGED(-3)
+            if (index < 0) break;
 
             ByteBuffer buf = codec.getOutputBuffer(index);
             if (buf != null) {
-                if (BufferUtils.isCodecConfig(info)) {
-                    info.size = 0; // csd-0 已随 outputFormat 给 Muxer，不能再写一遍
-                }
-                if (info.size > 0) {
-                    sink.onSample(Track.AUDIO, buf, info);
-                }
+                if (BufferUtils.isCodecConfig(info)) info.size = 0;
+                if (info.size > 0) sink.onSample(Track.AUDIO, buf, info);
             }
             boolean eos = BufferUtils.isEndOfStream(info);
             codec.releaseOutputBuffer(index, false);
-            if (eos) {
-                Log.i(TAG, "收到音频 EOS");
-                break;
-            }
+            if (eos) { Log.i(TAG, "收到音频 EOS"); break; }
         }
     }
 
-    /** 停止采集后把编码器里残留的 AAC 包全部抽出。 */
     private void drainTail() {
         MediaCodec c = codec;
         if (c == null) return;
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-        // 发 EOS
         try {
             int idx = c.dequeueInputBuffer(200_000);
             if (idx >= 0) {
                 c.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
             }
         } catch (Throwable t) { Log.w(TAG, "发音频 EOS 失败", t); }
-        // 排空
         int idle = 0;
         while (idle < 100) {
+            MediaCodec.BufferInfo outInfo = new MediaCodec.BufferInfo();
             int outIdx;
-            try { outIdx = c.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US); }
+            try { outIdx = c.dequeueOutputBuffer(outInfo, DEQUEUE_TIMEOUT_US); }
             catch (Throwable t) { Log.w(TAG, "收尾排空失败", t); break; }
 
             if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) { idle++; continue; }
             if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                // 兜住「主循环被异常打断」时 csd-0 尚未传给 Muxer 的情况
                 sink.onTrackFormat(Track.AUDIO, c.getOutputFormat());
                 continue;
             }
@@ -278,23 +334,15 @@ public final class AudioEncoder {
 
             ByteBuffer buf = c.getOutputBuffer(outIdx);
             if (buf != null) {
-                if (BufferUtils.isCodecConfig(info)) info.size = 0;
-                if (info.size > 0) sink.onSample(Track.AUDIO, buf, info);
+                if (BufferUtils.isCodecConfig(outInfo)) outInfo.size = 0;
+                if (outInfo.size > 0) sink.onSample(Track.AUDIO, buf, outInfo);
             }
-            boolean eos = BufferUtils.isEndOfStream(info);
+            boolean eos = BufferUtils.isEndOfStream(outInfo);
             c.releaseOutputBuffer(outIdx, false);
             if (eos) { Log.i(TAG, "收到音频收尾 EOS"); break; }
         }
     }
 
-    // ------------------------------------------------------------------
-    // 时基计算
-    // ------------------------------------------------------------------
-
-    /**
-     * 反推第 0 个采样帧对应的系统单调时间（微秒）。
-     * 使音频 PTS 与视频 PTS（来自 System.nanoTime）落在同一时基上。
-     */
     private long resolveFrameZeroPtsUs(long framesConsumed) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && record != null) {
             try {
@@ -307,7 +355,6 @@ public final class AudioEncoder {
                 Log.w(TAG, "getTimestamp 失败，退化为估算", t);
             }
         }
-        // 降级：用当前时刻减去已采集时长
         return System.nanoTime() / 1000 - framesConsumed * 1_000_000L / sampleRate;
     }
 }

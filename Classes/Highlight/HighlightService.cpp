@@ -8,6 +8,11 @@
 #include <android/native_window_jni.h>
 #include <android/log.h>
 #include <memory>
+#include <vector>
+#include <mutex>
+#include <time.h>
+#include "platform/android/jni/JniHelper.h"
+#include "audio/android/PcmAudioService.h"
 
 #define TAG "HighlightService"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -15,9 +20,81 @@
 
 static std::unique_ptr<GameFrameCapture> gCapture;
 
+// ── 音频攒批状态 ──────────────────────────────────────────────────────────
+// 攒够约 100ms 的 PCM 再传一次 JNI，降低调用频率（~43次/秒 → ~10次/秒）
+static std::vector<uint8_t> gAudioAccumulator;
+static int64_t   gFirstSampleTs  = -1;   // 本批第一个采样点的 CLOCK_MONOTONIC 时间戳（ns）
+static int       gAudioSampleRate = 0;
+static int       gAudioChannels   = 0;
+static size_t    gAudioBatchThreshold = 0; // 攒批阈值（字节），init 后计算
+
+// ── JNI 缓存 ──────────────────────────────────────────────────────────────
+static jclass    gHighlightRecorderClass = nullptr;
+static jmethodID gOnAudioBatchMethod     = nullptr;
+
+// 保护 gAudioAccumulator 等攒批状态：
+// onAudioFrame 在 OpenSL ES 音频线程调用，stop() 在主线程调用，两者会并发访问
+static std::mutex gAudioMutex;
+
+// 注意：音频回调运行在 OpenSL ES 创建的 native 线程上。native 线程上的 FindClass
+// 只能用系统类加载器，找不到 APK 里的应用类。这里通过 Cocos 缓存的应用 ClassLoader
+// （JniHelper::getStaticMethodInfo 内部使用）加载，并由 JniHelper::getEnv() 通过
+// pthread key 负责线程退出时自动 Detach。
+static bool initAudioJni() {
+    if (gHighlightRecorderClass && gOnAudioBatchMethod) return true;
+
+    // static void onAudioBatch(byte[] pcm, int sampleRate, int channels, long ptsNs)
+    cocos2d::JniMethodInfo mi;
+    if (!cocos2d::JniHelper::getStaticMethodInfo(
+            mi, "org/cocos2dx/cpp/highlight/HighlightRecorder",
+            "onAudioBatch", "([BIIJ)V")) {
+        LOGE("initAudioJni: 找不到 HighlightRecorder.onAudioBatch");
+        return false;
+    }
+    gHighlightRecorderClass = (jclass)mi.env->NewGlobalRef(mi.classID);
+    gOnAudioBatchMethod = mi.methodID;
+    mi.env->DeleteLocalRef(mi.classID);
+    return true;
+}
+
+static int64_t audioNowNs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+// 调用方必须已持有 gAudioMutex
+static void flushAudioBatchLocked() {
+    if (gAudioAccumulator.empty()) return;
+
+    JNIEnv* env = cocos2d::JniHelper::getEnv();
+    if (!env || !initAudioJni()) {
+        gAudioAccumulator.clear();
+        gFirstSampleTs = -1;
+        return;
+    }
+
+    int size = (int)gAudioAccumulator.size();
+    jbyteArray jArr = env->NewByteArray(size);
+    if (jArr) {
+        env->SetByteArrayRegion(jArr, 0, size, (jbyte*)gAudioAccumulator.data());
+        env->CallStaticVoidMethod(
+            gHighlightRecorderClass, gOnAudioBatchMethod,
+            jArr, gAudioSampleRate, gAudioChannels, (jlong)gFirstSampleTs);
+        env->DeleteLocalRef(jArr);
+    }
+
+    // 任何一步抛了 Java 异常都必须清掉，否则这个线程后续的 JNI 调用会被 CheckJNI 中止
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+
+    gAudioAccumulator.clear();
+    gFirstSampleTs = -1;
+}
+
 // ── JNI 工具：在 GL 线程执行任务 ─────────────────────────────────────────
-// Cocos GL 线程通过 Cocos2dxGLSurfaceView.queueEvent 投递，
-// C++ 侧用 Director::getInstance()->getScheduler()->performFunctionInCocosThread
 static void runOnGLThread(std::function<void()> fn) {
     cocos2d::Director::getInstance()
         ->getScheduler()
@@ -26,11 +103,41 @@ static void runOnGLThread(std::function<void()> fn) {
 
 // ── HighlightService 实现 ─────────────────────────────────────────────────
 
+void HighlightService::onAudioFrame(const void* buf, size_t size,
+                                     int sampleRate, int channels) {
+    if (!buf || size == 0) return;
+
+    std::lock_guard<std::mutex> lock(gAudioMutex);
+
+    // 首次调用时初始化采样率/声道数/阈值
+    if (gAudioSampleRate == 0) {
+        gAudioSampleRate = sampleRate;
+        gAudioChannels   = channels;
+        // 攒批阈值：100ms 的 PCM 字节数
+        // bytes = sampleRate × channels × 2(S16) × 0.1s
+        gAudioBatchThreshold = (size_t)(sampleRate * channels * 2 * 0.1);
+        LOGI("音频攒批初始化: sampleRate=%d channels=%d threshold=%zu",
+             sampleRate, channels, gAudioBatchThreshold);
+    }
+
+    // 记录本批第一个采样点的时间戳（与视频帧同一时钟源）
+    if (gFirstSampleTs < 0) {
+        gFirstSampleTs = audioNowNs();
+    }
+
+    const uint8_t* data = (const uint8_t*)buf;
+    gAudioAccumulator.insert(gAudioAccumulator.end(), data, data + size);
+
+    // 攒够阈值则传给 Java
+    if (gAudioAccumulator.size() >= gAudioBatchThreshold) {
+        flushAudioBatchLocked();
+    }
+}
+
 void HighlightService::onSurfaceReady(void* env, void* surface, int encW, int encH) {
     JNIEnv* jenv = static_cast<JNIEnv*>(env);
     jobject jsurface = static_cast<jobject>(surface);
 
-    // ANativeWindow 从 Java Surface 对象获取，必须在有效 JNIEnv 上调用
     ANativeWindow* win = ANativeWindow_fromSurface(jenv, jsurface);
     if (!win) {
         LOGE("onSurfaceReady: ANativeWindow_fromSurface 失败");
@@ -38,7 +145,6 @@ void HighlightService::onSurfaceReady(void* env, void* surface, int encW, int en
     }
     LOGI("onSurfaceReady: ANativeWindow=%p encW=%d encH=%d", win, encW, encH);
 
-    // GameFrameCapture 的 init 必须在 GL 线程执行（EGL 是线程绑定的）
     runOnGLThread([win, encW, encH]() {
         gCapture.reset(new GameFrameCapture());
         if (!gCapture->init(win, encW, encH)) {
@@ -47,12 +153,17 @@ void HighlightService::onSurfaceReady(void* env, void* surface, int encW, int en
         } else {
             LOGI("GameFrameCapture 初始化成功");
         }
-        // ANativeWindow 引用计数 -1，EGLSurface 已持有它，这里可以释放
         ANativeWindow_release(win);
     });
 }
 
 void HighlightService::start() {
+    // 注入音频分流回调（录制开始时才开始采集，避免录制前的音频进入缓冲）
+    cocos2d::experimental::PcmAudioService::setAudioCaptureCallback(
+        [](const void* buf, size_t size, int sampleRate, int channels) {
+            HighlightService::onAudioFrame(buf, size, sampleRate, channels);
+        });
+
     runOnGLThread([]() {
         if (!gCapture) {
             LOGE("start: GameFrameCapture 未初始化");
@@ -64,11 +175,19 @@ void HighlightService::start() {
 }
 
 void HighlightService::triggerHighlight(const std::string& eventName) {
-    // 阶段三实现：通知 Java 侧 PacketRingBuffer.snapshot()
-    LOGI("triggerHighlight: [%s]（阶段三实现）", eventName.c_str());
+    LOGI("triggerHighlight: [%s]（阶段四实现）", eventName.c_str());
 }
 
 void HighlightService::stop() {
+    // 先清除音频回调，停止分流
+    cocos2d::experimental::PcmAudioService::setAudioCaptureCallback(nullptr);
+
+    // 把剩余攒批数据刷出去，不丢最后一段音频
+    {
+        std::lock_guard<std::mutex> lock(gAudioMutex);
+        flushAudioBatchLocked();
+    }
+
     runOnGLThread([]() {
         if (gCapture) {
             gCapture->stopCapture();
@@ -78,17 +197,13 @@ void HighlightService::stop() {
     });
 }
 
-// ── JNI 入口：从 Java AppActivity 调用 C++ ───────────────────────────────
-// Java 侧调用顺序：
-//   nativeOnSurfaceReady(surface, encW, encH)  → HighlightService::onSurfaceReady
-//   nativeStart()                              → HighlightService::start
-//   nativeStop()                               → HighlightService::stop
+// ── JNI 入口 ──────────────────────────────────────────────────────────────
 
 extern "C" {
 
 JNIEXPORT void JNICALL
 Java_org_cocos2dx_cpp_AppActivity_nativeOnSurfaceReady(
-        JNIEnv* env, jobject /*thiz*/, jobject surface, jint encW, jint encH) {
+        JNIEnv* env, jobject, jobject surface, jint encW, jint encH) {
     HighlightService::onSurfaceReady(env, surface, encW, encH);
 }
 
@@ -106,10 +221,10 @@ Java_org_cocos2dx_cpp_AppActivity_nativeStop(JNIEnv*, jobject) {
 
 #else
 
-// 非 Android 平台：空实现
 void HighlightService::onSurfaceReady(void*, void*, int, int) {}
 void HighlightService::start() {}
 void HighlightService::triggerHighlight(const std::string&) {}
 void HighlightService::stop() {}
+void HighlightService::onAudioFrame(const void*, size_t, int, int) {}
 
 #endif // CC_PLATFORM_ANDROID
