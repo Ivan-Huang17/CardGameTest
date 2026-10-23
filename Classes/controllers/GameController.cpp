@@ -7,6 +7,8 @@
 
 #include "GameController.hpp"
 #include "LevelConfig.hpp"
+#include "HighlightService.hpp"
+#include "audio/include/AudioEngine.h"
 USING_NS_CC;
 //游戏入口
 void GameController::startGame(){
@@ -35,6 +37,8 @@ void GameController::_loadLevel(int levelID){
         CardView* card = _createCardAtPosition(centerPos, levelData.playfield[i]);
         log("创建 %d 成功",levelData.playfield[i].cardFace);
         card->setTouchCallback([this](CardView*card){
+            HighlightService::triggerHighlight("main_card_click");
+            cocos2d::experimental::AudioEngine::play2d("click.mp3", false);
             return this->_onMainCardTapped(card);
         });
         _cardPositions[card]=levelData.playfield[i].position;
@@ -48,6 +52,8 @@ void GameController::_loadLevel(int levelID){
         log("创建 %d 成功",levelData.stack[i].cardFace);
         
         card->setTouchCallback([this](CardView*card){
+            HighlightService::triggerHighlight("stack_card_click");
+            cocos2d::experimental::AudioEngine::play2d("click.mp3", false);
             return this->_onStackCardTapped(card);
         });
         _cardPositions[card]=levelData.stack[i].position;

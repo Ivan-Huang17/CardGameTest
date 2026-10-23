@@ -9,7 +9,7 @@
  *   AppActivity.onCreate 里调用 Java HighlightRecorder.prepare()
  *   → C++ HighlightService::onSurfaceReady(surface) 接收 InputSurface
  *   → HighlightService::start() 启动录制
- *   → HighlightService::triggerHighlight("event") 触发片段截取（阶段四实现）
+ *   → HighlightService::triggerHighlight("event") 触发一次高光，Java 侧截取并暂存片段
  *   → HighlightService::stop() 停止录制
  *
  * 音频路径（引擎补丁点 PcmAudioService::enqueue 调用）：
@@ -20,6 +20,12 @@ class HighlightService {
 public:
     static void onSurfaceReady(void* env, void* surface, int encW, int encH);
     static void start();
+
+    /**
+     * 触发一次高光：通过 JNI 通知 Java 侧，只传事件名和触发时刻（CLOCK_MONOTONIC 微秒）。
+     * Java 侧约 1 秒后从环形缓冲取出「触发前 1 秒 ~ 触发后 1 秒」的音视频 packet 并暂存。
+     * 调用立即返回，不等待截取完成。
+     */
     static void triggerHighlight(const std::string& eventName = "");
     static void stop();
 

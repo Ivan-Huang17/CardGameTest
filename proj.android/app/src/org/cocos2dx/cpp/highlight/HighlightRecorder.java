@@ -2,11 +2,14 @@ package org.cocos2dx.cpp.highlight;
 
 import android.media.MediaFormat;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.util.Log;
 import android.view.Surface;
 
 import java.io.File;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -21,7 +24,7 @@ import java.util.Locale;
  * <pre>
  *   prepare()   → 创建编码器，返回 InputSurface 给 C++ 侧做 EGL 初始化
  *   start()     → 启动编码器，开始接收帧，样本持续写入 PacketRingBuffer
- *   stop()      → 停止编码，并把环形缓冲的全部内容封装成 MP4 保存到相册（验证用）
+ *   stop()      → 停止编码，并把已暂存的高光片段（storedClips）合并封装成一个 MP4 保存到相册
  * </pre>
  *
  * <h3>线程说明</h3>
@@ -44,10 +47,26 @@ public final class HighlightRecorder {
 
     private final android.content.Context context;
 
+    // 高光截取窗口：触发时刻前后各 1 秒，共 2 秒
+    private static final long PRE_ROLL_US  = 1_000_000L;
+    private static final long POST_ROLL_US = 1_000_000L;
+    // 等触发后 1 秒的数据入库后再截取。额外留 200ms 余量：
+    // 音频批次最多攒 ~100ms 才送到 Java，加上 AAC 编码延迟，否则窗口末尾的音频可能还没进缓冲
+    private static final long POST_ROLL_WAIT_MS = POST_ROLL_US / 1000 + 200;
+    // 暂存片段数量上限。每个片段约 1MB（4Mbps × ~2s），且持有的 packet 不会随环形缓冲淘汰而释放，
+    // 不设上限的话频繁点击会持续占用内存
+    private static final int MAX_STORED_CLIPS = 20;
+
     private VideoEncoder videoEncoder;
     private AudioEncoder audioEncoder;
     private RingBufferSink ringBufferSink;
     private PacketRingBuffer ringBuffer;
+
+    // 触发后延迟截取用的后台线程，不能占用游戏线程和 JNI 调用线程
+    private volatile HandlerThread triggerThread;
+    private volatile Handler triggerHandler;
+    // 已截取并暂存的高光片段（最旧的在前）
+    private final List<HighlightClip> storedClips = new ArrayList<>();
 
     // 供 C++ 通过 JNI 调用的单例访问
     private static HighlightRecorder instance;
@@ -93,6 +112,14 @@ public final class HighlightRecorder {
         // 创建环形缓冲区和它的 Sink
         ringBuffer = new PacketRingBuffer(MAX_GOP_COUNT);
         ringBufferSink = new RingBufferSink(ringBuffer);
+
+        // 启动高光截取线程（重复 prepare 时复用）
+        if (triggerThread == null) {
+            HandlerThread t = new HandlerThread("hl-trigger");
+            t.start();
+            triggerThread = t;
+            triggerHandler = new Handler(t.getLooper());
+        }
 
         // 创建 VideoEncoder，输出接到环形缓冲（不再直写 Mp4Muxer）
         videoEncoder = new VideoEncoder(
@@ -150,9 +177,8 @@ public final class HighlightRecorder {
     }
 
     /**
-     * 停止录制：停止视频/音频编码器，再把环形缓冲当前的全部内容
-     * 封装成一个 MP4 保存到相册（{@link #dumpBufferToMp4()}）。
-     * 按触发时刻截取片段的逻辑在阶段四实现。
+     * 停止录制：停止视频/音频编码器，再把已暂存的高光片段（storedClips）
+     * 合并封装成一个 MP4 保存到相册（{@link #dumpStoredClipsToMp4()}）。
      */
     public void stop() {
         if (videoEncoder == null) {
@@ -181,103 +207,134 @@ public final class HighlightRecorder {
 
         logBufferStats();
 
-        // 把环形缓冲当前全量内容转储成 MP4 落盘，用于验证视频+音频是否正常
+        // 把已暂存的高光片段（storedClips）合并封装成一个 MP4 落盘
         try {
-            dumpBufferToMp4();
+            dumpStoredClipsToMp4();
         } catch (Throwable t) {
-            Log.e(TAG, "dumpBufferToMp4 异常", t);
+            Log.e(TAG, "dumpStoredClipsToMp4 异常", t);
+        }
+
+        // 停止高光截取线程，未执行的延迟截取随之取消
+        HandlerThread captureThread = triggerThread;
+        if (captureThread != null) {
+            captureThread.quitSafely();
+            triggerThread = null;
+            triggerHandler = null;
         }
     }
 
     /**
-     * 把环形缓冲里的所有内容封装成一个 MP4 落盘到相册。
-     * 用于阶段三/四验证：确认视频帧和音频帧都正确录入、时间戳正常。
+     * 把已暂存的高光片段（{@link #storedClips}）按触发先后顺序合并写入同一个 MP4，保存到相册。
+     * 两次点击间隔很短时片段内容会重叠，重叠部分按原样重复保留，不做去重。
      */
-    private void dumpBufferToMp4() {
-        if (ringBuffer == null || ringBuffer.gopCount() == 0) {
-            Log.w(TAG, "dumpBufferToMp4: 环形缓冲为空，跳过");
-            return;
-        }
-
-        // 取全量时间范围的 snapshot
-        long startUs = ringBuffer.earliestVideoPts();
-        long endUs   = ringBuffer.latestVideoPts();
-        HighlightClip clip = ringBuffer.snapshot(startUs, endUs);
-
-        if (clip.isEmpty()) {
-            Log.w(TAG, "dumpBufferToMp4: snapshot 为空");
+    private void dumpStoredClipsToMp4() {
+        List<HighlightClip> clips = getStoredClips();
+        if (clips.isEmpty()) {
+            Log.w(TAG, "dumpStoredClipsToMp4: 没有暂存的高光片段，跳过");
             return;
         }
 
         MediaFormat videoFmt = ringBufferSink.getVideoFormat();
         MediaFormat audioFmt = ringBufferSink.getAudioFormat();
-        Log.i(TAG, "dumpBufferToMp4: clip video=" + clip.videoPackets.size()
-                + " audio=" + clip.audioPackets.size()
+        Log.i(TAG, "dumpStoredClipsToMp4: 共 " + clips.size() + " 个片段"
                 + " videoFmt=" + (videoFmt != null) + " audioFmt=" + (audioFmt != null));
         if (videoFmt == null) {
-            Log.w(TAG, "dumpBufferToMp4: 没有视频格式，跳过");
+            Log.w(TAG, "dumpStoredClipsToMp4: 没有视频格式，跳过");
             return;
         }
 
         String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-        File tempFile = MediaStoreSaver.newTempFile(context, "HL_dump_" + timestamp);
+        writeClipsToMp4(clips, videoFmt, audioFmt, "HL_highlights_" + timestamp);
+    }
 
-        boolean hasAudio = (audioFmt != null && !clip.audioPackets.isEmpty());
+    /** 片段之间的时间间隔（约 1 帧），保证相邻片段衔接处同一条轨道的时间戳严格递增。 */
+    private static final long CLIP_GAP_US = 33_333L;
+
+    private static void writeSample(Mp4Muxer muxer, android.media.MediaCodec.BufferInfo info,
+                                    Track track, EncodedPacket pkt, long ptsUs) {
+        int flags = (track == Track.VIDEO && pkt.isKeyFrame)
+                ? android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+        info.set(0, pkt.data.length, ptsUs, flags);
+        muxer.onSample(track, java.nio.ByteBuffer.wrap(pkt.data), info);
+    }
+
+    /**
+     * 把多个片段依次写入同一个 MP4 并发布到相册。
+     *
+     * <p>每个片段的时间戳以自身视频起点（已对齐到关键帧）归零，再整体平移到上一个片段之后，
+     * 音频和视频使用同一个平移量，片段内部的音画关系保持不变。
+     * 每个片段都以关键帧开头，首尾相接后仍可正常解码。
+     */
+    private void writeClipsToMp4(List<HighlightClip> clips, MediaFormat videoFmt,
+                                 MediaFormat audioFmt, String fileName) {
+        boolean hasAudio = false;
+        if (audioFmt != null) {
+            for (HighlightClip clip : clips) {
+                if (!clip.audioPackets.isEmpty()) {
+                    hasAudio = true;
+                    break;
+                }
+            }
+        }
+
+        File tempFile = MediaStoreSaver.newTempFile(context, fileName);
         Mp4Muxer muxer;
         try {
             muxer = new Mp4Muxer(tempFile.getAbsolutePath(), hasAudio, 0);
         } catch (Exception e) {
-            Log.e(TAG, "dumpBufferToMp4: Mp4Muxer 创建失败", e);
+            Log.e(TAG, "writeClipsToMp4: Mp4Muxer 创建失败 " + fileName, e);
             return;
         }
 
-        // PTS 归零：以最早视频帧为基准
-        long basePtsUs = clip.actualStartUs;
-        muxer.setTimeBase(basePtsUs);
-
-        // 通知 muxer 轨道格式
+        // 不调用 setTimeBase：时间戳已经在下面自己平移好，Mp4Muxer 的归零基准保持为 0
         muxer.onTrackFormat(Track.VIDEO, videoFmt);
         if (hasAudio) {
             muxer.onTrackFormat(Track.AUDIO, audioFmt);
         }
 
-        // 写入视频包
         android.media.MediaCodec.BufferInfo info = new android.media.MediaCodec.BufferInfo();
-        for (EncodedPacket pkt : clip.videoPackets) {
-            java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(pkt.data);
-            int flags = pkt.isKeyFrame ? android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
-            info.set(0, pkt.data.length, pkt.ptsUs, flags);
-            muxer.onSample(Track.VIDEO, buf, info);
-        }
+        long offsetUs = 0;
+        int usedClips = 0;
+        for (HighlightClip clip : clips) {
+            if (clip.isEmpty()) continue;
 
-        // 写入音频包
-        if (hasAudio) {
-            for (EncodedPacket pkt : clip.audioPackets) {
-                java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(pkt.data);
-                info.set(0, pkt.data.length, pkt.ptsUs, 0);
-                muxer.onSample(Track.AUDIO, buf, info);
+            // 片段内时间戳 = 原时间戳 - 片段视频起点，再加上本片段在合并文件里的起始偏移
+            long startUs = clip.actualStartUs;
+            long lastUs = 0;
+            for (EncodedPacket pkt : clip.videoPackets) {
+                writeSample(muxer, info, Track.VIDEO, pkt, offsetUs + pkt.ptsUs - startUs);
+                lastUs = Math.max(lastUs, pkt.ptsUs - startUs);
             }
+            if (hasAudio) {
+                for (EncodedPacket pkt : clip.audioPackets) {
+                    writeSample(muxer, info, Track.AUDIO, pkt, offsetUs + pkt.ptsUs - startUs);
+                    lastUs = Math.max(lastUs, pkt.ptsUs - startUs);
+                }
+            }
+
+            offsetUs += lastUs + CLIP_GAP_US;
+            usedClips++;
         }
 
         Mp4Muxer.Stats stats = muxer.stop();
-        Log.i(TAG, "dumpBufferToMp4: 封装完成 " + stats);
+        Log.i(TAG, "writeClipsToMp4: 封装完成 " + fileName + " 片段=" + usedClips + " " + stats);
 
         if (tempFile.length() <= 0 || stats.videoFrames <= 0) {
-            Log.e(TAG, "dumpBufferToMp4: 输出文件为空");
+            Log.e(TAG, "writeClipsToMp4: 输出文件为空 " + fileName);
             MediaStoreSaver.deleteQuietly(tempFile);
             return;
         }
 
-        String displayName = tempFile.getName();
-        Uri uri = MediaStoreSaver.publish(context, tempFile, displayName);
+        Uri uri = MediaStoreSaver.publish(context, tempFile, tempFile.getName());
         if (uri != null) {
-            Log.i(TAG, "=== dump 完成，已保存到相册：" + uri
+            Log.i(TAG, "=== 高光视频已保存到相册：" + uri
+                    + " 片段=" + usedClips
                     + " video=" + stats.videoFrames + "帧"
                     + " audio=" + stats.audioFrames + "包"
-                    + " 时长≈" + stats.durationMs() / 1000 + "s ===");
+                    + " 时长≈" + stats.durationMs() + "ms ===");
             MediaStoreSaver.deleteQuietly(tempFile);
         } else {
-            Log.w(TAG, "dumpBufferToMp4: 落盘失败，临时文件：" + tempFile.getAbsolutePath());
+            Log.w(TAG, "writeClipsToMp4: 落盘失败，临时文件：" + tempFile.getAbsolutePath());
         }
     }
 
@@ -300,6 +357,75 @@ public final class HighlightRecorder {
         Log.i(TAG, String.format(Locale.US,
                 "缓冲区状态: GOP数=%d 跨度=%.1fs 总字节=%d(%.1fKB) earliest=%d latest=%d",
                 gopCount, spanSec, totalBytes, totalBytes / 1024.0, earliest, latest));
+    }
+
+    // ------------------------------------------------------------------
+    // 高光触发（C++ HighlightService::triggerHighlight 经 JNI 调用）
+    // ------------------------------------------------------------------
+
+    /**
+     * C++ 在游戏点击时调用。立即返回，不阻塞游戏线程：
+     * 只记录触发时刻并安排一次延迟截取。
+     *
+     * @param eventName 事件名，仅用于日志
+     * @param triggerUs 触发时刻，CLOCK_MONOTONIC 微秒，与视频/音频 packet 的 PTS 同一时基
+     */
+    public static void onTriggerHighlight(String eventName, long triggerUs) {
+        HighlightRecorder rec = instance;
+        if (rec == null) return;
+        rec.scheduleCapture(eventName, triggerUs);
+    }
+
+    private void scheduleCapture(final String eventName, final long triggerUs) {
+        Handler h = triggerHandler;
+        if (h == null || ringBuffer == null) {
+            Log.w(TAG, "triggerHighlight 被忽略：录制尚未准备好 event=" + eventName);
+            return;
+        }
+        h.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                captureClip(eventName, triggerUs);
+            }
+        }, POST_ROLL_WAIT_MS);
+    }
+
+    /**
+     * 从环形缓冲取出 [触发前 1 秒, 触发后 1 秒] 的 packet 并暂存。
+     * 视频起点会向前对齐到 GOP 的关键帧，所以视频可能比 2 秒多出至多 1 个 GOP，
+     * 这是保证片段可独立解码所必需的；音频则严格按窗口截取。
+     */
+    private void captureClip(String eventName, long triggerUs) {
+        PacketRingBuffer rb = ringBuffer;
+        if (rb == null) return;
+
+        HighlightClip clip = rb.snapshot(triggerUs - PRE_ROLL_US, triggerUs + POST_ROLL_US);
+        if (clip.isEmpty()) {
+            Log.w(TAG, "高光片段为空，丢弃 event=" + eventName);
+            return;
+        }
+
+        int stored;
+        synchronized (storedClips) {
+            storedClips.add(clip);
+            while (storedClips.size() > MAX_STORED_CLIPS) {
+                storedClips.remove(0);
+            }
+            stored = storedClips.size();
+        }
+        Log.i(TAG, "高光片段已暂存 event=" + eventName
+                + " video=" + clip.videoPackets.size()
+                + " audio=" + clip.audioPackets.size()
+                + " 窗口=[" + (triggerUs - PRE_ROLL_US) + "," + (triggerUs + POST_ROLL_US) + "]us"
+                + " 实际视频起点=" + clip.actualStartUs
+                + " 当前暂存=" + stored);
+    }
+
+    /** 已暂存的高光片段（副本，最旧的在前）。 */
+    public List<HighlightClip> getStoredClips() {
+        synchronized (storedClips) {
+            return new ArrayList<>(storedClips);
+        }
     }
 
     /** 供阶段四使用：获取环形缓冲区实例（用于截取高光片段）。 */

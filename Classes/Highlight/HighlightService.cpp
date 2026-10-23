@@ -175,7 +175,30 @@ void HighlightService::start() {
 }
 
 void HighlightService::triggerHighlight(const std::string& eventName) {
-    LOGI("triggerHighlight: [%s]（阶段四实现）", eventName.c_str());
+    // 触发时刻取 CLOCK_MONOTONIC（微秒），与视频帧、音频批次的 PTS 同一时钟源，
+    // Java 侧据此在环形缓冲里定位 [触发前1秒, 触发后1秒] 的 packet
+    const int64_t triggerUs = audioNowNs() / 1000;
+
+    // 只传事件名和时间戳，不传任何包数据；点击回调频率低，每次直接取类即可，不做缓存。
+    // 时间戳是 64 位，JniHelper::callStaticVoidMethod 的模板不支持，所以手写调用。
+    cocos2d::JniMethodInfo mi;
+    if (!cocos2d::JniHelper::getStaticMethodInfo(
+            mi, "org/cocos2dx/cpp/highlight/HighlightRecorder",
+            "onTriggerHighlight", "(Ljava/lang/String;J)V")) {
+        LOGE("triggerHighlight: 找不到 HighlightRecorder.onTriggerHighlight");
+        return;
+    }
+
+    jstring jName = mi.env->NewStringUTF(eventName.c_str());
+    mi.env->CallStaticVoidMethod(mi.classID, mi.methodID, jName, (jlong)triggerUs);
+    if (mi.env->ExceptionCheck()) {
+        mi.env->ExceptionDescribe();
+        mi.env->ExceptionClear();
+    }
+    if (jName) mi.env->DeleteLocalRef(jName);
+    mi.env->DeleteLocalRef(mi.classID);
+
+    LOGI("triggerHighlight: [%s] triggerUs=%lld", eventName.c_str(), (long long)triggerUs);
 }
 
 void HighlightService::stop() {

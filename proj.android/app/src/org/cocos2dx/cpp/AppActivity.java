@@ -108,7 +108,7 @@ public class AppActivity extends Cocos2dxActivity {
 
             // 阶段三验证：录 30 秒后自动停止（超过 maxGopCount=20s，观察淘汰是否生效）
             new Handler(Looper.getMainLooper()).postDelayed(
-                    this::stopHighlightRecording, 30_000);
+                    this::stopHighlightRecording, 20_000);
         }, 500);
     }
 
